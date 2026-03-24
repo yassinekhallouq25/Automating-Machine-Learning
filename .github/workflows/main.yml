@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -21,21 +22,20 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install deepchecks
-          
-      - name: Create a folder
-        run: |
-          mkdir -p results
-          
-      - name: Validate Data
-        run: |
-          python data_validation.py
-      - name: Validate Model Performance
-        run: |
-          python train_validation.py
-      - name: Archive Deepchecks Results
+          pip install pandas scikit-learn "deepchecks<0.18" anywidget plotly
+
+      - name: Create results folder
+        run: mkdir -p results
+
+      - name: Run Data Validation
+        run: python data_validation.py
+
+      - name: Run Model Validation
+        run: python train_validation.py
+
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: deepchecks results
-          path: results/*_validation.html
+          name: deepchecks-results
+          path: results/
