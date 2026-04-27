@@ -1,8 +1,8 @@
 import pandas as pd
 from deepchecks.tabular import Dataset
-from deepchecks.tabular.suites import classification_performance
+from deepchecks.tabular.suites import model_evaluation
 
-# Create datasets
+# Create train dataset
 train_ds = Dataset(
     pd.concat(
         [
@@ -13,9 +13,10 @@ train_ds = Dataset(
     ),
     label="target",
     cat_features=[],
-    task_type="binary"   # or "multiclass"
+    task_type="binary"   # change to "multiclass" if more than 2 classes
 )
 
+# Create test dataset
 test_ds = Dataset(
     pd.concat(
         [
@@ -26,13 +27,13 @@ test_ds = Dataset(
     ),
     label="target",
     cat_features=[],
-    task_type="binary"   # or "multiclass"
+    task_type="binary"   # change to "multiclass" if more than 2 classes
 )
 
-# Classification suite
-suite = classification_performance()
+# Default model evaluation suite
+suite = model_evaluation()
 
-# Run
+# Run suite
 result = suite.run(
     train_dataset=train_ds,
     test_dataset=test_ds,
