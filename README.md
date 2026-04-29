@@ -1,25 +1,34 @@
-Title: Replace setup.py with pyproject.toml for pricing_checks package
+print(train_ds.data.dtypes)
+print(test_ds.data.dtypes)
 
-Description:
+print(type(train_ds.features[0]), train_ds.features)
+print(type(train_ds.label_name), train_ds.label_name)
 
-The pricing_checks package was originally configured using setup.py. This worked, but setup.py is no longer the preferred standard for modern Python packaging.
+pred = mapper.predict(test_ds.data[test_ds.features].head())
+proba = mapper.predict_proba(test_ds.data[test_ds.features].head())
 
-This issue tracks the update to move the package configuration from setup.py to pyproject.toml, which is now the standard approach for defining Python package metadata and build settings.
+print("pred:", pred, type(pred), np.asarray(pred).dtype)
+print("proba:", proba, type(proba), np.asarray(proba).dtype)
 
-Changes made:
 
-Removed the old setup.py packaging configuration.
-Added a pyproject.toml file for the pricing_checks package.
-Moved package metadata, dependencies, and build configuration into pyproject.toml.
-Updated the package structure to follow modern Python packaging standards.
 
-Reason for change:
+def predict_proba(self, X):
+    X_input = X[["X1", "X2", "r"]].to_numpy(dtype=float)
 
-Using pyproject.toml makes the package easier to maintain and aligns it with current Python packaging best practices.
+    p1 = self.model.predict(X_input)
+    p1 = np.asarray(p1, dtype=float).reshape(-1)
 
-Acceptance criteria:
+    return np.column_stack([1 - p1, p1]).astype(float)
 
-The package can be installed successfully.
-The package can be built using the new pyproject.toml configuration.
-No packaging information remains duplicated between setup.py and pyproject.toml.
-Existing functionality of pricing_checks continues to work after the packaging update.
+
+    def predict(self, X):
+    proba = self.predict_proba(X)
+    return np.array([0, 1])[np.argmax(proba, axis=1)]
+
+
+    result = suite.run(
+    train_dataset=train_ds,
+    test_dataset=test_ds,
+    model=mapper,
+    model_classes=[0, 1]
+)
