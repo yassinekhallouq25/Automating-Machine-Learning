@@ -1,127 +1,48 @@
-import pandas as pd
+def run_logic(self, context, dataset_kind) -> CheckResult:  # ← rename + fix signature
+    from deepchecks.tabular.context import Context
+    from deepchecks.utils.strings import format_header
 
-from sklearn.datasets import make_classification
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
+    dataset = context.get_dataset(dataset_kind)
+    df = dataset.data.copy()
 
-from deepchecks.tabular import Dataset, Suite
+    label_col = self.label_col or dataset.label_name
 
-from pricing_checks.checks.custom.model_evaluation.base_model_comparison import (
-    BaseModelComparison,
-)
+    if label_col is None:
+        raise ValueError(
+            "Label column was not found. Pass label_col=... or create "
+            "the Deepchecks Dataset with label=..."
+        )
 
+    X = df.drop(columns=[label_col])
+    y_true = df[label_col]
 
-# --------------------------------------------------
-# 1. Generate fake classification data
-# --------------------------------------------------
-X, y = make_classification(
-    n_samples=1000,
-    n_features=12,
-    n_informative=8,
-    n_redundant=2,
-    n_classes=2,
-    weights=[0.65, 0.35],
-    random_state=42,
-)
+    base_pred = self.base_model.predict(X)
+    candidate_pred = self.candidate_model.predict(X)
 
-feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+    base_proba = self._safe_predict_proba(self.base_model, X)
+    candidate_proba = self._safe_predict_proba(self.candidate_model, X)
 
-df = pd.DataFrame(X, columns=feature_names)
-df["target"] = y
+    rows = []
 
-target_col = "target"
+    for metric_name in self.metrics:
+        base_score = self._score_metric(metric_name, y_true, base_pred, base_proba)
+        candidate_score = self._score_metric(metric_name, y_true, candidate_pred, candidate_proba)
 
+        higher_is_better = self.HIGHER_IS_BETTER[metric_name]
+        improvement = candidate_score - base_score if higher_is_better else base_score - candidate_score
+        required_improvement = self.min_improvement.get(metric_name, 0.0)
+        passed = improvement >= required_improvement
 
-# --------------------------------------------------
-# 2. Split into train and test
-# --------------------------------------------------
-train_df, test_df = train_test_split(
-    df,
-    test_size=0.25,
-    random_state=42,
-    stratify=df[target_col],
-)
+        rows.append({
+            "metric": metric_name,
+            "base_model": base_score,
+            "candidate_model": candidate_score,
+            "higher_is_better": higher_is_better,
+            "improvement": improvement,
+            "required_improvement": required_improvement,
+            "passed": passed,
+        })
 
-X_train = train_df.drop(columns=[target_col])
-y_train = train_df[target_col]
+    result_df = pd.DataFrame(rows)
 
-
-# --------------------------------------------------
-# 3. Train base model
-# --------------------------------------------------
-base_model = LogisticRegression(
-    max_iter=2000,
-    solver="lbfgs",
-)
-
-base_model.fit(X_train, y_train)
-
-
-# --------------------------------------------------
-# 4. Train candidate model
-# --------------------------------------------------
-candidate_model = RandomForestClassifier(
-    n_estimators=150,
-    max_depth=6,
-    random_state=42,
-)
-
-candidate_model.fit(X_train, y_train)
-
-
-# --------------------------------------------------
-# 5. Create Deepchecks Dataset
-# --------------------------------------------------
-test_dataset = Dataset(
-    test_df,
-    label=target_col,
-    cat_features=[],
-)
-
-
-# --------------------------------------------------
-# 6. Create custom Deepchecks check
-# --------------------------------------------------
-check = BaseModelComparison(
-    base_model=base_model,
-    candidate_model=candidate_model,
-    label_col=target_col,
-    metrics=[
-        "accuracy",
-        "f1_macro",
-        "precision_macro",
-        "recall_macro",
-        "roc_auc",
-        "log_loss",
-    ],
-    min_improvement={
-        "accuracy": 0.0,
-        "f1_macro": 0.0,
-        "precision_macro": 0.0,
-        "recall_macro": 0.0,
-        "roc_auc": 0.0,
-        "log_loss": 0.0,
-    },
-).add_condition_candidate_passes_all_metrics()
-
-
-# --------------------------------------------------
-# 7. Run as a Deepchecks suite
-# --------------------------------------------------
-suite = Suite(
-    "Generated Data - Base Model vs Candidate Model",
-    check,
-)
-
-result = suite.run(test_dataset)
-
-result.show()
-
-
-# --------------------------------------------------
-# 8. Also print raw result table
-# --------------------------------------------------
-single_result = check.run(test_dataset)
-
-print(single_result.value)
+    return CheckResult(value=result_df, display=[result_df])
