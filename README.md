@@ -4,11 +4,14 @@ pricing_checks/checks/model_evaluation/model_performance_comparison.py
 
 from __future__ import annotations
 
+import abc
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from deepchecks.core import BaseCheck, CheckResult, ConditionCategory, ConditionResult
+from deepchecks.core import CheckResult, ConditionCategory, ConditionResult
+from deepchecks.core.checks import DatasetKind
+from deepchecks.tabular import SingleDatasetCheck
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -81,24 +84,27 @@ def _compute_metrics(
 # Check
 # ---------------------------------------------------------------------------
 
-class ModelPerformanceComparison(BaseCheck):
+class ModelPerformanceComparison(SingleDatasetCheck):
     """Compare a candidate model's classification performance to a base model.
 
-    Each metric appears as its own row in Deepchecks' native
-    Conditions Summary table (Status / Check / Condition / More Info).
+    Inherits from SingleDatasetCheck so it is accepted by Deepchecks Suite.
+    Each metric gets its own row in the native Conditions Summary table.
 
-    Call ``add_condition_performance_not_degraded()`` to register all
-    per-metric conditions before running.
+    Usage
+    -----
+    check = (
+        ModelPerformanceComparison(base_model=base_clf, threshold=0.05)
+        .add_condition_performance_not_degraded()
+    )
 
-    Parameters
-    ----------
-    base_model :
-        Fitted sklearn-compatible classifier.
-    metrics :
-        Metrics to evaluate. Defaults to all six:
-        roc_auc, log_loss, f1, precision, recall, accuracy.
-    threshold :
-        Max relative degradation allowed (default 0.05 = 5 %).
+    # Standalone
+    result = check.run(ds_test, model=candidate_clf)
+    result.show()
+
+    # Inside a Suite (shows full Conditions Summary table)
+    from deepchecks.core import Suite
+    suite = Suite("Pricing Model Suite", check)
+    suite.run(ds_test, model=candidate_clf).show()
     """
 
     def __init__(
@@ -114,17 +120,20 @@ class ModelPerformanceComparison(BaseCheck):
         self.threshold = threshold
 
     # ------------------------------------------------------------------
-    # run
+    # run_logic — called by SingleDatasetCheck.run() via Context
+    # context.train  → the Dataset passed to .run()
+    # context.model  → the candidate model passed to .run()
     # ------------------------------------------------------------------
 
-    def run(self, dataset, model=None, **kwargs) -> CheckResult:
-        if model is None:
-            raise ValueError("Pass the candidate model via model=<your_model>.")
+    def run_logic(self, context, dataset_kind=DatasetKind.TRAIN) -> CheckResult:
+        dataset      = context.train          # deepchecks.tabular.Dataset
+        model        = context.model          # candidate model
 
-        X       = dataset.features_columns
+        X       = dataset.features_columns    # pd.DataFrame
         y_true  = np.asarray(dataset.data[dataset.label_name])
         classes = np.unique(y_true)
 
+        # ── Predictions ──────────────────────────────────────────────
         cand_pred = np.asarray(model.predict(X))
         base_pred = np.asarray(self.base_model.predict(X))
 
@@ -139,10 +148,11 @@ class ModelPerformanceComparison(BaseCheck):
             cand_proba = np.asarray(model.predict_proba(X))
             base_proba = np.asarray(self.base_model.predict_proba(X))
 
+        # ── Compute scores ───────────────────────────────────────────
         cand_scores = _compute_metrics(y_true, cand_pred, cand_proba, self.metrics, classes)
         base_scores = _compute_metrics(y_true, base_pred, base_proba, self.metrics, classes)
 
-        # Plain dataframe shown under "Check With Conditions Output"
+        # ── Build display dataframe ──────────────────────────────────
         rows = []
         for metric in self.metrics:
             cv, bv = cand_scores[metric], base_scores[metric]
@@ -158,54 +168,41 @@ class ModelPerformanceComparison(BaseCheck):
 
         display_df = pd.DataFrame(rows).set_index("Metric")
 
-        result = CheckResult(
+        return CheckResult(
             value={"candidate_scores": cand_scores, "base_scores": base_scores},
             display=[display_df],
             header="Model Performance Comparison vs Base Model",
         )
-        result.check = self
-        return result
 
     # ------------------------------------------------------------------
-    # Conditions — ONE per metric → one row each in Conditions Summary
+    # Conditions — one per metric → one row each in Conditions Summary
     # ------------------------------------------------------------------
 
     def add_condition_performance_not_degraded(
         self, threshold: Optional[float] = None
     ) -> "ModelPerformanceComparison":
-        """
-        Register one condition per metric.
-        Each metric gets its own row in the native Deepchecks
-        Conditions Summary table:
-
-            Status | Check                              | Condition                                      | More Info
-            ✓      | Model Performance Comparison ...   | ROC AUC: candidate not worse than base by >5%  | base=0.8821  candidate=0.9012  Δ=+0.0191
-            ✗      | Model Performance Comparison ...   | Log Loss: candidate not worse than base by >5% | base=0.3210  candidate=0.3890  Δ=-0.0680
-            ...
-        """
+        """Register one condition per metric so each appears as its own row
+        in the native Deepchecks Conditions Summary table."""
         _t = threshold if threshold is not None else self.threshold
 
         for metric in self.metrics:
-            # We need a default-argument capture to avoid the closure-loop problem
-            def _make_condition(m: str, t: float) -> callable:
-                lower       = m in _LOWER_IS_BETTER
-                name        = _DISPLAY_NAMES.get(m, m)
-                direction   = "lower" if lower else "higher"
+            def _make_condition(m: str, t: float):
+                lower = m in _LOWER_IS_BETTER
 
                 def _condition(value: dict) -> ConditionResult:
                     cv = value["candidate_scores"][m]
                     bv = value["base_scores"][m]
-                    passed = (
-                        cv <= bv * (1 + t) if lower else cv >= bv * (1 - t)
-                    )
-                    delta = (bv - cv) if lower else (cv - bv)
+                    passed = (cv <= bv * (1 + t)) if lower else (cv >= bv * (1 - t))
+                    delta  = (bv - cv) if lower else (cv - bv)
                     more_info = (
                         f"base={bv:.4f}  candidate={cv:.4f}  "
                         f"Δ={delta:+.4f}  "
                         f"({'improvement' if delta >= 0 else 'degradation'})"
                     )
-                    category = ConditionCategory.PASS if passed else ConditionCategory.FAIL
-                    return ConditionResult(category, more_info)
+                    return ConditionResult(
+                        ConditionCategory.PASS if passed else ConditionCategory.FAIL,
+                        more_info,
+                    )
 
                 return _condition
 
