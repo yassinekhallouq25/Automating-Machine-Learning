@@ -1,20 +1,41 @@
-from sklearn.datasets import load_breast_cancer
+import pandas as pd
+
+from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 
 from deepchecks.tabular import Dataset, Suite
-from pricing_checks.checks.custom import BaseModelComparison
+
+from pricing_checks.checks.custom.model_evaluation.base_model_comparison import (
+    BaseModelComparison,
+)
 
 
-# 1. Load binary classification data
-data = load_breast_cancer(as_frame=True)
-df = data.frame
+# --------------------------------------------------
+# 1. Generate fake classification data
+# --------------------------------------------------
+X, y = make_classification(
+    n_samples=1000,
+    n_features=12,
+    n_informative=8,
+    n_redundant=2,
+    n_classes=2,
+    weights=[0.65, 0.35],
+    random_state=42,
+)
+
+feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+
+df = pd.DataFrame(X, columns=feature_names)
+df["target"] = y
 
 target_col = "target"
 
 
-# 2. Train/test split
+# --------------------------------------------------
+# 2. Split into train and test
+# --------------------------------------------------
 train_df, test_df = train_test_split(
     df,
     test_size=0.25,
@@ -26,20 +47,32 @@ X_train = train_df.drop(columns=[target_col])
 y_train = train_df[target_col]
 
 
+# --------------------------------------------------
 # 3. Train base model
-base_model = LogisticRegression(max_iter=1000)
+# --------------------------------------------------
+base_model = LogisticRegression(
+    max_iter=2000,
+    solver="lbfgs",
+)
+
 base_model.fit(X_train, y_train)
 
 
+# --------------------------------------------------
 # 4. Train candidate model
+# --------------------------------------------------
 candidate_model = RandomForestClassifier(
-    n_estimators=100,
+    n_estimators=150,
+    max_depth=6,
     random_state=42,
 )
+
 candidate_model.fit(X_train, y_train)
 
 
-# 5. Create Deepchecks dataset
+# --------------------------------------------------
+# 5. Create Deepchecks Dataset
+# --------------------------------------------------
 test_dataset = Dataset(
     test_df,
     label=target_col,
@@ -47,7 +80,9 @@ test_dataset = Dataset(
 )
 
 
-# 6. Create the custom comparison check
+# --------------------------------------------------
+# 6. Create custom Deepchecks check
+# --------------------------------------------------
 check = BaseModelComparison(
     base_model=base_model,
     candidate_model=candidate_model,
@@ -68,17 +103,25 @@ check = BaseModelComparison(
         "roc_auc": 0.0,
         "log_loss": 0.0,
     },
-).add_condition_candidate_better_or_equal()
+).add_condition_candidate_passes_all_metrics()
 
 
-# 7. Run the check inside a Deepchecks suite
+# --------------------------------------------------
+# 7. Run as a Deepchecks suite
+# --------------------------------------------------
 suite = Suite(
-    "Candidate vs Base Model Classification Suite",
+    "Generated Data - Base Model vs Candidate Model",
     check,
 )
 
 result = suite.run(test_dataset)
 
-
-# 8. Display result
 result.show()
+
+
+# --------------------------------------------------
+# 8. Also print raw result table
+# --------------------------------------------------
+single_result = check.run(test_dataset)
+
+print(single_result.value)
