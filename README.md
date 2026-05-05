@@ -1,45 +1,5 @@
 """
 pricing_checks/checks/model_evaluation/model_performance_comparison.py
-
-Drop this file into:
-    pricing_checks/checks/model_evaluation/model_performance_comparison.py
-
-A custom Deepchecks-style check that compares a candidate model's
-classification performance against a base/reference model.
-
-It avoids the internal Context / dataset_kind machinery entirely by
-overriding run() directly, which makes it compatible with all recent
-versions of deepchecks and immune to internal API changes.
-
-Metrics (classification)
--------------------------
-Metric         Direction   Why it matters
------------    ---------   -----------------------------------------------
-ROC AUC        higher ↑    Threshold-independent discriminative power
-Log Loss       lower  ↓    Calibration quality (bad probs = high loss)
-F1  (macro)    higher ↑    Balanced precision / recall across classes
-Precision      higher ↑    How clean the positive predictions are
-Recall         higher ↑    How many real positives are captured
-Accuracy       higher ↑    Overall correctness baseline
-
-Usage
------
-from deepchecks.tabular import Dataset
-from pricing_checks.checks.model_evaluation.model_performance_comparison import (
-    ModelPerformanceComparison,
-)
-
-check = (
-    ModelPerformanceComparison(
-        base_model=base_clf,
-        metrics=["roc_auc", "log_loss", "f1", "precision", "recall", "accuracy"],
-        threshold=0.05,          # 5 % max relative degradation
-    )
-    .add_condition_performance_not_degraded()
-)
-
-result = check.run(ds_test, model=candidate_clf)
-result.show()
 """
 
 from __future__ import annotations
@@ -77,7 +37,7 @@ _DEFAULT_METRICS: List[str] = list(_DISPLAY_NAMES.keys())
 
 
 # ---------------------------------------------------------------------------
-# Internal helper
+# Helper
 # ---------------------------------------------------------------------------
 
 def _compute_metrics(
@@ -93,40 +53,26 @@ def _compute_metrics(
     for m in metrics:
         if m == "accuracy":
             out[m] = accuracy_score(y_true, y_pred)
-
         elif m == "f1":
             out[m] = f1_score(y_true, y_pred, average="macro", zero_division=0)
-
         elif m == "precision":
             out[m] = precision_score(y_true, y_pred, average="macro", zero_division=0)
-
         elif m == "recall":
             out[m] = recall_score(y_true, y_pred, average="macro", zero_division=0)
-
         elif m == "roc_auc":
             if y_proba is None:
-                raise ValueError(
-                    "roc_auc requires predict_proba(). "
-                    "Make sure both models expose it."
-                )
-            if multiclass:
-                out[m] = roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro")
-            else:
-                out[m] = roc_auc_score(y_true, y_proba[:, 1])
-
+                raise ValueError("roc_auc requires predict_proba().")
+            out[m] = (
+                roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro")
+                if multiclass
+                else roc_auc_score(y_true, y_proba[:, 1])
+            )
         elif m == "log_loss":
             if y_proba is None:
-                raise ValueError(
-                    "log_loss requires predict_proba(). "
-                    "Make sure both models expose it."
-                )
+                raise ValueError("log_loss requires predict_proba().")
             out[m] = log_loss(y_true, y_proba)
-
         else:
-            raise ValueError(
-                f"Unknown metric '{m}'. "
-                f"Supported: {list(_DISPLAY_NAMES.keys())}"
-            )
+            raise ValueError(f"Unknown metric '{m}'. Supported: {list(_DISPLAY_NAMES.keys())}")
 
     return out
 
@@ -138,22 +84,21 @@ def _compute_metrics(
 class ModelPerformanceComparison(BaseCheck):
     """Compare a candidate model's classification performance to a base model.
 
-    Inherits from ``BaseCheck`` and overrides ``run()`` directly so that it
-    never touches Deepchecks' internal Context / dataset_kind pipeline —
-    making it robust across deepchecks versions.
+    Each metric appears as its own row in Deepchecks' native
+    Conditions Summary table (Status / Check / Condition / More Info).
+
+    Call ``add_condition_performance_not_degraded()`` to register all
+    per-metric conditions before running.
 
     Parameters
     ----------
     base_model :
-        A fitted sklearn-compatible classifier (needs predict, and
-        predict_proba if roc_auc / log_loss are requested).
+        Fitted sklearn-compatible classifier.
     metrics :
-        Metric names to evaluate. Defaults to all six.
+        Metrics to evaluate. Defaults to all six:
+        roc_auc, log_loss, f1, precision, recall, accuracy.
     threshold :
-        Max *relative* degradation tolerated before the condition fails.
-        For higher-is-better: candidate >= base * (1 - threshold).
-        For lower-is-better (log_loss): candidate <= base * (1 + threshold).
-        Default 0.05 (5 %).
+        Max relative degradation allowed (default 0.05 = 5 %).
     """
 
     def __init__(
@@ -169,31 +114,22 @@ class ModelPerformanceComparison(BaseCheck):
         self.threshold = threshold
 
     # ------------------------------------------------------------------
-    # Public run() — called directly by the user or by a Suite
+    # run
     # ------------------------------------------------------------------
 
-    def run(self, dataset, model=None, **kwargs) -> CheckResult:  # type: ignore[override]
-        """
-        Parameters
-        ----------
-        dataset : deepchecks.tabular.Dataset
-        model   : fitted sklearn-compatible candidate classifier
-        """
+    def run(self, dataset, model=None, **kwargs) -> CheckResult:
         if model is None:
             raise ValueError("Pass the candidate model via model=<your_model>.")
 
-        # ── Extract X and y ──────────────────────────────────────────
-        X = dataset.features_columns          # pd.DataFrame
-        y_true = np.asarray(dataset.data[dataset.label_name])
+        X       = dataset.features_columns
+        y_true  = np.asarray(dataset.data[dataset.label_name])
         classes = np.unique(y_true)
 
-        # ── Predictions ──────────────────────────────────────────────
         cand_pred = np.asarray(model.predict(X))
         base_pred = np.asarray(self.base_model.predict(X))
 
         needs_proba = any(m in self.metrics for m in ("roc_auc", "log_loss"))
-        cand_proba: Optional[np.ndarray] = None
-        base_proba: Optional[np.ndarray] = None
+        cand_proba = base_proba = None
 
         if needs_proba:
             if not hasattr(model, "predict_proba"):
@@ -203,71 +139,81 @@ class ModelPerformanceComparison(BaseCheck):
             cand_proba = np.asarray(model.predict_proba(X))
             base_proba = np.asarray(self.base_model.predict_proba(X))
 
-        # ── Compute scores ───────────────────────────────────────────
         cand_scores = _compute_metrics(y_true, cand_pred, cand_proba, self.metrics, classes)
         base_scores = _compute_metrics(y_true, base_pred, base_proba, self.metrics, classes)
 
-        # ── Build display table ──────────────────────────────────────
+        # Plain dataframe shown under "Check With Conditions Output"
         rows = []
         for metric in self.metrics:
             cv, bv = cand_scores[metric], base_scores[metric]
             lower  = metric in _LOWER_IS_BETTER
-            delta  = (bv - cv) if lower else (cv - bv)   # positive = improvement
-            passed = (cv <= bv * (1 + self.threshold)) if lower else (cv >= bv * (1 - self.threshold))
+            delta  = (bv - cv) if lower else (cv - bv)
             rows.append({
                 "Metric":             _DISPLAY_NAMES.get(metric, metric),
                 "Base Model":         round(bv, 6),
                 "Candidate Model":    round(cv, 6),
                 "Δ (Candidate−Base)": round(delta, 6),
                 "Direction":          "↓ lower is better" if lower else "↑ higher is better",
-                "Pass":               "✅" if passed else "❌",
             })
 
-        result_df = pd.DataFrame(rows).set_index("Metric")
+        display_df = pd.DataFrame(rows).set_index("Metric")
 
         result = CheckResult(
             value={"candidate_scores": cand_scores, "base_scores": base_scores},
-            display=result_df,
+            display=[display_df],
             header="Model Performance Comparison vs Base Model",
         )
-        result.check = self  # required by Deepchecks internals (conditions, display, suite)
+        result.check = self
         return result
 
     # ------------------------------------------------------------------
-    # Condition
+    # Conditions — ONE per metric → one row each in Conditions Summary
     # ------------------------------------------------------------------
 
     def add_condition_performance_not_degraded(
         self, threshold: Optional[float] = None
     ) -> "ModelPerformanceComparison":
-        """Fail if the candidate degrades beyond *threshold* on any metric."""
+        """
+        Register one condition per metric.
+        Each metric gets its own row in the native Deepchecks
+        Conditions Summary table:
+
+            Status | Check                              | Condition                                      | More Info
+            ✓      | Model Performance Comparison ...   | ROC AUC: candidate not worse than base by >5%  | base=0.8821  candidate=0.9012  Δ=+0.0191
+            ✗      | Model Performance Comparison ...   | Log Loss: candidate not worse than base by >5% | base=0.3210  candidate=0.3890  Δ=-0.0680
+            ...
+        """
         _t = threshold if threshold is not None else self.threshold
 
-        def _condition(value: dict) -> ConditionResult:
-            cand, base = value["candidate_scores"], value["base_scores"]
-            failures: List[str] = []
+        for metric in self.metrics:
+            # We need a default-argument capture to avoid the closure-loop problem
+            def _make_condition(m: str, t: float) -> callable:
+                lower       = m in _LOWER_IS_BETTER
+                name        = _DISPLAY_NAMES.get(m, m)
+                direction   = "lower" if lower else "higher"
 
-            for metric, cv in cand.items():
-                bv    = base[metric]
-                lower = metric in _LOWER_IS_BETTER
-                passed = (cv <= bv * (1 + _t)) if lower else (cv >= bv * (1 - _t))
-                if not passed:
-                    name = _DISPLAY_NAMES.get(metric, metric)
-                    failures.append(f"{name}: base={bv:.4f} candidate={cv:.4f}")
+                def _condition(value: dict) -> ConditionResult:
+                    cv = value["candidate_scores"][m]
+                    bv = value["base_scores"][m]
+                    passed = (
+                        cv <= bv * (1 + t) if lower else cv >= bv * (1 - t)
+                    )
+                    delta = (bv - cv) if lower else (cv - bv)
+                    more_info = (
+                        f"base={bv:.4f}  candidate={cv:.4f}  "
+                        f"Δ={delta:+.4f}  "
+                        f"({'improvement' if delta >= 0 else 'degradation'})"
+                    )
+                    category = ConditionCategory.PASS if passed else ConditionCategory.FAIL
+                    return ConditionResult(category, more_info)
 
-            if failures:
-                return ConditionResult(
-                    ConditionCategory.FAIL,
-                    f"Candidate underperforms base (threshold={_t*100:.1f}%): "
-                    + " | ".join(failures),
-                )
-            return ConditionResult(
-                ConditionCategory.PASS,
-                f"Candidate meets or beats base model on all metrics "
-                f"(threshold={_t*100:.1f}%).",
+                return _condition
+
+            condition_name = (
+                f"{_DISPLAY_NAMES.get(metric, metric)}: "
+                f"candidate not worse than base by >{_t*100:.0f}% "
+                f"({'lower' if metric in _LOWER_IS_BETTER else 'higher'} is better)"
             )
+            self.add_condition(condition_name, _make_condition(metric, _t))
 
-        return self.add_condition(
-            f"Candidate not degraded vs base model (threshold={_t*100:.1f}%)",
-            _condition,
-        )
+        return self
