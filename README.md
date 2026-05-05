@@ -4,14 +4,16 @@ pricing_checks/checks/model_evaluation/model_performance_comparison.py
 
 from __future__ import annotations
 
-import abc
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
 from deepchecks.core import CheckResult, ConditionCategory, ConditionResult
 from deepchecks.core.checks import DatasetKind
 from deepchecks.tabular import SingleDatasetCheck
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -38,10 +40,33 @@ _DISPLAY_NAMES: Dict[str, str] = {
 
 _DEFAULT_METRICS: List[str] = list(_DISPLAY_NAMES.keys())
 
+BaselineType = Literal["logistic_regression", "random_forest"]
+
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
+
+def _build_baseline(baseline: BaselineType):
+    """Return an unfitted baseline estimator based on the chosen type."""
+    if baseline == "logistic_regression":
+        return CalibratedClassifierCV(
+            LogisticRegression(max_iter=1000, random_state=42),
+            method="sigmoid",   # Platt scaling
+            cv=5,
+        )
+    elif baseline == "random_forest":
+        return CalibratedClassifierCV(
+            RandomForestClassifier(n_estimators=100, random_state=42),
+            method="sigmoid",   # Platt scaling
+            cv=5,
+        )
+    else:
+        raise ValueError(
+            f"Unknown baseline '{baseline}'. "
+            "Choose 'logistic_regression' or 'random_forest'."
+        )
+
 
 def _compute_metrics(
     y_true: np.ndarray,
@@ -75,7 +100,9 @@ def _compute_metrics(
                 raise ValueError("log_loss requires predict_proba().")
             out[m] = log_loss(y_true, y_proba)
         else:
-            raise ValueError(f"Unknown metric '{m}'. Supported: {list(_DISPLAY_NAMES.keys())}")
+            raise ValueError(
+                f"Unknown metric '{m}'. Supported: {list(_DISPLAY_NAMES.keys())}"
+            )
 
     return out
 
@@ -85,57 +112,74 @@ def _compute_metrics(
 # ---------------------------------------------------------------------------
 
 class ModelPerformanceComparison(SingleDatasetCheck):
-    """Compare a candidate model's classification performance to a base model.
+    """Compare a candidate model's classification performance to a built-in baseline.
 
-    Inherits from SingleDatasetCheck so it is accepted by Deepchecks Suite.
-    Each metric gets its own row in the native Conditions Summary table.
+    The baseline is trained on the same dataset at run time (fit + evaluate on
+    the same split — useful for a quick sanity check). For a proper evaluation
+    pass pre-split train/test datasets via a Suite.
+
+    Parameters
+    ----------
+    baseline : 'logistic_regression' | 'random_forest'
+        Which baseline model to use. Both are Platt-scaled (CalibratedClassifierCV
+        with method='sigmoid') so they produce well-calibrated probabilities for
+        ROC AUC and Log Loss.
+    metrics :
+        Metrics to evaluate. Defaults to all six:
+        roc_auc, log_loss, f1, precision, recall, accuracy.
+    threshold :
+        Max relative degradation allowed before a condition fails (default 0.05 = 5%).
+        For log_loss (lower-is-better): candidate <= base * (1 + threshold).
+        For all others: candidate >= base * (1 - threshold).
 
     Usage
     -----
-    check = (
-        ModelPerformanceComparison(base_model=base_clf, threshold=0.05)
-        .add_condition_performance_not_degraded()
+    from deepchecks.core import Suite
+    from pricing_checks.checks.model_evaluation.model_performance_comparison import (
+        ModelPerformanceComparison,
     )
 
-    # Standalone
-    result = check.run(ds_test, model=candidate_clf)
-    result.show()
-
-    # Inside a Suite (shows full Conditions Summary table)
-    from deepchecks.core import Suite
-    suite = Suite("Pricing Model Suite", check)
-    suite.run(ds_test, model=candidate_clf).show()
+    suite = Suite(
+        "Pricing Model Suite",
+        ModelPerformanceComparison(
+            baseline="logistic_regression",   # or "random_forest"
+            threshold=0.05,
+        ).add_condition_performance_not_degraded()
+    )
+    suite.run(ds_test, model=candidate_model).show()
     """
 
     def __init__(
         self,
-        base_model,
+        baseline: BaselineType = "logistic_regression",
         metrics: Optional[List[str]] = None,
         threshold: float = 0.05,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.base_model = base_model
-        self.metrics: List[str] = metrics if metrics is not None else _DEFAULT_METRICS
-        self.threshold = threshold
+        self.baseline      = baseline
+        self.metrics       = metrics if metrics is not None else _DEFAULT_METRICS
+        self.threshold     = threshold
 
     # ------------------------------------------------------------------
-    # run_logic — called by SingleDatasetCheck.run() via Context
-    # context.train  → the Dataset passed to .run()
-    # context.model  → the candidate model passed to .run()
+    # run_logic
     # ------------------------------------------------------------------
 
     def run_logic(self, context, dataset_kind=DatasetKind.TRAIN) -> CheckResult:
-        dataset      = context.train          # deepchecks.tabular.Dataset
-        model        = context.model          # candidate model
+        dataset = context.train
+        model   = context.model
 
-        X       = dataset.features_columns    # pd.DataFrame
-        y_true  = np.asarray(dataset.data[dataset.label_name])
+        X      = dataset.features_columns
+        y_true = np.asarray(dataset.data[dataset.label_name])
         classes = np.unique(y_true)
+
+        # ── Fit baseline on the same data ────────────────────────────
+        base_model = _build_baseline(self.baseline)
+        base_model.fit(X, y_true)
 
         # ── Predictions ──────────────────────────────────────────────
         cand_pred = np.asarray(model.predict(X))
-        base_pred = np.asarray(self.base_model.predict(X))
+        base_pred = np.asarray(base_model.predict(X))
 
         needs_proba = any(m in self.metrics for m in ("roc_auc", "log_loss"))
         cand_proba = base_proba = None
@@ -143,46 +187,31 @@ class ModelPerformanceComparison(SingleDatasetCheck):
         if needs_proba:
             if not hasattr(model, "predict_proba"):
                 raise ValueError("Candidate model has no predict_proba().")
-            if not hasattr(self.base_model, "predict_proba"):
-                raise ValueError("Base model has no predict_proba().")
             cand_proba = np.asarray(model.predict_proba(X))
-            base_proba = np.asarray(self.base_model.predict_proba(X))
+            base_proba = np.asarray(base_model.predict_proba(X))
 
         # ── Compute scores ───────────────────────────────────────────
         cand_scores = _compute_metrics(y_true, cand_pred, cand_proba, self.metrics, classes)
         base_scores = _compute_metrics(y_true, base_pred, base_proba, self.metrics, classes)
 
-        # ── Build display dataframe ──────────────────────────────────
-        rows = []
-        for metric in self.metrics:
-            cv, bv = cand_scores[metric], base_scores[metric]
-            lower  = metric in _LOWER_IS_BETTER
-            delta  = (bv - cv) if lower else (cv - bv)
-            rows.append({
-                "Metric":             _DISPLAY_NAMES.get(metric, metric),
-                "Base Model":         round(bv, 6),
-                "Candidate Model":    round(cv, 6),
-                "Δ (Candidate−Base)": round(delta, 6),
-                "Direction":          "↓ lower is better" if lower else "↑ higher is better",
-            })
-
-        display_df = pd.DataFrame(rows).set_index("Metric")
-
         return CheckResult(
-            value={"candidate_scores": cand_scores, "base_scores": base_scores},
-            display=[display_df],
+            value={
+                "candidate_scores": cand_scores,
+                "base_scores":      base_scores,
+                "baseline_type":    self.baseline,
+            },
+            display=[],   # no additional output — conditions summary is enough
             header="Model Performance Comparison vs Base Model",
         )
 
     # ------------------------------------------------------------------
-    # Conditions — one per metric → one row each in Conditions Summary
+    # Conditions — one per metric
     # ------------------------------------------------------------------
 
     def add_condition_performance_not_degraded(
         self, threshold: Optional[float] = None
     ) -> "ModelPerformanceComparison":
-        """Register one condition per metric so each appears as its own row
-        in the native Deepchecks Conditions Summary table."""
+        """One condition per metric → one row each in the Conditions Summary table."""
         _t = threshold if threshold is not None else self.threshold
 
         for metric in self.metrics:
@@ -195,9 +224,7 @@ class ModelPerformanceComparison(SingleDatasetCheck):
                     passed = (cv <= bv * (1 + t)) if lower else (cv >= bv * (1 - t))
                     delta  = (bv - cv) if lower else (cv - bv)
                     more_info = (
-                        f"base={bv:.4f}  candidate={cv:.4f}  "
-                        f"Δ={delta:+.4f}  "
-                        f"({'improvement' if delta >= 0 else 'degradation'})"
+                        f"base={bv:.4f}  candidate={cv:.4f}  Δ={delta:+.4f}"
                     )
                     return ConditionResult(
                         ConditionCategory.PASS if passed else ConditionCategory.FAIL,
